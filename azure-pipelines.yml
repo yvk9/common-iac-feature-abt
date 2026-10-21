@@ -1,1 +1,203 @@
+# Azure Infrastructure pipeline
+trigger: none
+
+pool:
+  name: itops
+
+resources:
+  repositories:
+    - repository: enterprise-iac
+      type: git
+      name: Modernization/enterprise-templates
+      ref: refs/heads/main
+
+parameters:
+  - name: terraform_folders
+    type: object
+    default:
+      - landingzone
+      - app
+  - name: destroyResources
+    displayName: "Destroy Resources?"
+    type: boolean
+    default: false
+  - name: includeAdditionalTfVariables
+    displayName: "Include Additional TF Variables?"
+    type: boolean
+    default: true
+  - name: select_stage
+    displayName: "Stage Select Override?"
+    type: boolean
+    default: true
+  - name: tf_log
+    displayName: Terraform logs
+    type: string
+    default: OFF
+    values:
+      - TRACE
+      - DEBUG
+      - INFO
+      - WARN
+      - ERROR
+      - OFF
+  # Resource Group Locks
+  - name: onlyLocks
+    displayName: "Lock Operations Only"
+    type: boolean
+    default: false
+  - name: folder_to_execute
+    displayName: "Folder to execute?"
+    default: all
+    values:
+    - landingzone
+    - app
+    - all
+  - name: region
+    displayName: "Region to be deployed"
+    default: usaz
+    values:
+      - usva
+      - usaz
+  - name: environment
+    displayName: "Environment to be deployed"
+    default: dev
+    values:
+      - dev
+      - int
+      - lod
+      - prd
+  - name: rgLock
+    displayName: Resource Group Lock Management
+    type: string
+    default: none
+    values:
+      - none
+      - both
+      - unlock
+      - lock
+  - name: rgLocks
+    displayName: Resource Group Lock Scope(s)
+    type: object
+    default:
+      - rgName: ""
+        connection: ""
+        subId: ""
+  - name: skipPreApply
+    displayName: "Skip Pre-Apply Validation and Approval?"
+    type: boolean
+    default: false
+  - name: runAdhoc
+    displayName: "Run Adhoc state operations (commandsFile)?"
+    type: boolean
+    default: false
+  - name: commandsFile
+    displayName: "Adhoc commands file (relative to the folder to execute)"
+    type: string
+    default: "commands.txt"
+
+variables:
+  # Global settings
+  - name: environment
+    value: ${{ parameters.environment }}
+  - name: region
+    value: ${{ parameters.region }}
+  - name: libraryName
+    value: "Build_Agent_Secrets" # Library name in ADO associated with this project
+  - group: "fortify_ssc"
+  - name: tf_version
+    value: "1.14.4" # landingzone/ and app/ require Terraform ~> 1.14
+  # ADO
+  - group: "Build_Agent_Secrets"
+  - name: approver
+    value: "abbott.ashiofu@fdcctx.us"
+
+  # ====================#
+  # Service Connections #
+  # ====================#
+  - name: provider_service_arm
+    value: "eftps_sub_app_c_${{ parameters.environment}}" #Used for Backend State (Shared Services Subscription generally)
+  - name: backend_service_arm
+    value: "eftps_sub_it_ops_prd" #Used for Key Vault access (Shared Services Subscription generally, but could be different)
+
+  # Pipeline Container Jobs
+  - name: runtimeContainer
+    value: ""
+  - name: runtimeContainerEndpoint
+    value: ""
+
+  # Backend - State
+  - name: backendResourceGroupName
+    value: "rg-itops-sstfstate-$(region)-$(environment)"
+  - name: backendStorageAccountName
+    value: "stsstfstate$(region)$(environment)" # Hard coded the region because the state storage is only in one region
+  - name: workloadAbv
+    value: "app-c" # ENSURE UNIQUE WITH WORKLOAD
+  - name: backendContainerName
+    value: "$(workloadAbv)-$(environment)"
+
+  # ========================================
+  # Additional Terraform Variables
+  # ========================================
+  # Key Vault configuration (optional - only needed for non-auth secrets like Wiz secrets, etc.)
+  - name: kv_name
+    value: "" # Update KV name where connection information is stored
+  - name: secretsFilter_workload # Update with list of NON-AUTH secrets needed (Wiz secrets, etc.)
+    value: "none"
+
+  - name: additionalTfVariables
+    value: ""
+    # value: >-
+    #   -var "admin_password=$(admin_password)"
+
+  - name: runOnHost
+    value: true
+
+# Stages
+stages:
+  ##### Workload START ######
+  # Initialize -> per folder: Adhoc -> Plan -> Apply | Destroy; or ResourceLocks (onlyLocks), from one template call
+  - template: azure-pipelines/pipeline/terraform-pipeline.yml@enterprise-iac
+    parameters:
+      # Stage toggles (select_stage off = nothing runs; destroyResources flips Adhoc/Plan/Apply to Destroy)
+      enableInitialize: ${{ parameters.select_stage }}
+      enableAdhoc: ${{ and(parameters.select_stage, parameters.runAdhoc, not(parameters.destroyResources)) }}
+      enablePlan: ${{ and(parameters.select_stage, not(parameters.destroyResources)) }}
+      enableApply: ${{ and(parameters.select_stage, not(parameters.destroyResources)) }}
+      enableDestroy: ${{ and(parameters.select_stage, parameters.destroyResources) }}
+      onlyLocks: ${{ parameters.onlyLocks }}   # true = Initialize -> ResourceLocks only
+      commandsFile: ${{ parameters.commandsFile }}
+      # Folder selection: the template loops terraform_folders when folder_to_execute is ''/'all'.
+      # Stages are named <folder>_Plan, <folder>_Apply, ...; {folder} is filled in by the template.
+      folders: ${{ parameters.terraform_folders }}
+      folderToExecute: ${{ parameters.folder_to_execute }}
+      runName: "$(Build.BuildId)-$(environment)-$(region)-{folder}"
+      # Common config parameters
+      environment: $(environment)
+      region: $(region)
+      libraryName: ${{ variables.libraryName }}
+      tfvars: "$(environment)-terraform.tfvars"
+      additionalTfVariables: $(additionalTfVariables)
+      tf_version: $(tf_version)
+      tf_log: ${{ parameters.tf_log }}
+      runtimeContainer: ${{ variables.runtimeContainer }}
+      runtimeContainerEndpoint: ${{ variables.runtimeContainerEndpoint }}
+      runOnHost: ${{ variables.runOnHost }}
+      providerServiceArm: $(provider_service_arm)
+      backendServiceArm: $(backend_service_arm)
+      backendServiceArmKeyVault: $(backend_service_arm)
+      backendResourceGroupName: $(backendResourceGroupName)
+      backendStorageAccountName: $(backendStorageAccountName)
+      backendContainerName: $(backendContainerName)
+      backendKey: "{folder}/$(environment)-$(region)-$(workloadAbv).tfstate"   # one state file per folder
+      secretsFilter: ${{ variables.secretsFilter_workload }}
+      terraformModulesPat: $(PAT_TOKEN)
+      # Approvals
+      approver: $(approver)
+      skipPreApply: ${{ parameters.skipPreApply }}
+      destroyApprover: $(approver)
+      # Locks
+      rgLock: ${{ parameters.rgLock }}
+      rgLocks: ${{ parameters.rgLocks }}
+      # Fortify
+      fortifyToken: $(EFTPS_SSC_TKN)
 
